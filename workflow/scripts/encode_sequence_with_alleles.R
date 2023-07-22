@@ -5,9 +5,12 @@
 
 library(argparse)
 library(VariantAnnotation)
+library(tidyverse)
+library(tidyfast)
 library(GenomicRanges)
 library(data.table)
-library(parallel)
+library(chunkR)
+
 
 parser <- ArgumentParser()
 
@@ -71,22 +74,6 @@ case3 <- template %>%
 allele.mapping <- rbind(case1, case2, case3)
 
 # Load in SNPs ------------------------------------------------------------
-
-
-#--> Load data, this is in bed format
-ref.dt <- fread(args$reference, nrows = 100) %>% 
-  dplyr::select(-c(V4, V5, V6)) %>% 
-  dplyr::rename(chrom = "V1", start = "V2", end = "V3") %>% 
-  dplyr::mutate(locus = paste0(chrom, ":", start, "-", end)) %>% 
-  separate(col = V7, sep = "", into = paste0("seq", 0:1000)) %>% 
-  pivot_longer(cols = starts_with("seq"), names_to = "seqix", values_to = "reference") %>% 
-  dplyr::mutate(start = start + as.numeric(str_remove(seqix, "seq"))) %>% 
-  left_join(sequence_mapping, by = "reference") %>% 
-  dplyr::select(chrom, start, locus, reference, A, C, G, `T`) %>% 
-  drop_na() %>% # empty string returned by separate gives a nonsense row for every chunk
-  dplyr::mutate(alternate = reference, variant.call = "0/0")
-
-
 tmp <- VariantAnnotation::readVcf(args$variants)
 
 # Cast to BED standard (0-based, half open)
@@ -96,70 +83,91 @@ snps.dt <-
   rownames_to_column("locus") %>% 
   rename("variant.call" = 2) %>%
   separate(col = locus, into = c("chrom", "start", "reference", "alternate")) %>% 
-  dplyr::mutate(start = as.numeric(start) - 1) %>% 
-  left_join(allele.mapping, by = c("reference", "alternate", "variant.call")) %>% 
-  full_join(snps.dt, dplyr::select(ref.dt, chrom, start, locus), by = c("chrom", "start"))
+  dplyr::filter(chrom %in% unique(ref.dt$chrom),
+                reference %in% c("A", "C", "G", "T")) %>% 
+  dplyr::mutate(start = as.numeric(start) - 1,
+                end = start + 1) %>% 
+  left_join(allele.mapping, by = c("reference", "alternate", "variant.call"))
 
 gc()
 
+
+# Create function to process reference data (will be read in chunk --------
+
+# Keep everything in BED standard, changes happen to VCF
+
+#--> Load data, this is in bed format (coordinate change is corrected implicitly with
+# separate ranging from 0). Keep in BED format (0, 1]
+# chr1:12579:12580, but by the end of plumbing, it is chr1:12579
+ref.raw.dt <- fread(args$reference)
+
+cast_reference_data_to_snp_format <- function(dt){
+  
+  # Calculate interval width
+  width <- as.numeric(dt[1, "V3"] - dt[1, "V2"])
+  dummy.cols <- paste0("seq", 1:width)
+  
+  dt %>% 
+    # Column names
+    dplyr::rename(chrom = "V1", start = "V2", end = "V3",
+                  strand = "V4", x = "V5", n = "V6") %>% 
+    # Keep track of locus, since these will be written out to final BED files
+    dplyr::mutate(locus = paste0(chrom, ":", start, "-", end)) %>% 
+    # Split the string of letters (AACCTTGG) into however many variables we need
+    # It's ok that this produces NAs--there are unevenly sized intervals, which results in 
+    # empty columns
+    dt_separate(col = V7, sep = "", into = dummy.cols) %>% 
+    pivot_longer(cols = all_of(dummy.cols), names_to = "seqix", values_to = "reference") %>% 
+    dplyr::mutate(start = start + as.numeric(str_remove(seqix, "seq")) - 1,
+                  end = start + 1) %>% 
+    left_join(sequence_mapping, by = "reference") %>% 
+    dplyr::select(chrom, start, end, locus, reference, A, C, G, `T`) %>% 
+    drop_na() %>% # empty string returned by separate gives a nonsense row for every chunk
+    dplyr::mutate(alternate = reference, variant.call = "0/0")
+}
+
+cast_reference_data_to_snp_format(ref.raw.dt[1:1000, ])
+
+# seq.lengths <- unlist(lapply(ref.raw.dt$V7, str_length))
+# summary(seq.lengths)
+
+# Perform the pipeline to pieces at a time.
+dim(ref.dt)
+ 
+
 # May not be able to do this with data.tables after all. How many swaps do we need to make?
 # Us GRanges list where each list item is a locus and each 
-
-#--> Try to correct missing values of ref
 dim(ref.dt)
 dim(snps.dt)
 
+locus.dt <- dplyr::select(ref.dt, c(chrom, start, end, locus))
+snps.w.locus.dt <- left_join(snps.dt, locus.dt)
 
-merged <- anti_join(snps.dt, ref.dt, by = c("chrom", "start", "reference")) %>% 
-  bind_rows(ref.dt) 
+
+# Try to correct missing values of ref ----------------------------------------------------
+merged <- anti_join(ref.dt, snps.w.locus.dt, by = c("chrom", "start", "end", "reference")) %>% 
+  bind_rows(snps.w.locus.dt) %>% 
+  dplyr::arrange(chrom, start) %>% 
+  distinct() 
+
+
+merged <- bind_rows(snps.w.locus.dt, ref.dt) %>% 
+  group_by(chrom, start) %>% 
+  dplyr::filter(n() == 1 | variant.call != "0/0")
 
 # What happens when a position is in more than one locus? How to impute that?
 head(merged)
+
+# To check whether this works, we need to look at non homozygous ref
 merged %>% 
   dplyr::filter(variant.call != "0/0")
 
-# merged <- left_join(ref.dt, snps.dt, by = c("chrom", "start", "reference"))
-# drop_na(merged) %>% nrow()
+my.locus <- unique(merged$locus)[2]
+merged %>% 
+  dplyr::filter(locus == my.locus,
+                variant.call != "0/0") %>% 
+  distinct()
 
-#--> Check that centered on CpG
-# tmp <- as.character(ref.gr[1, "V7"])
-# L <- nchar(tmp)
-# if (substr(tmp, L/2, L/2 + 1) == "CG"){print("Middle characters are CG--good")}
-
-# 
-# # One-hot encode ----------------------------------------------------------
-# 
-# one_hot_encode <- function(x){
-#   
-#   if (x == "A"){
-#     c(1, 0, 0, 0)
-#   } else if (x == "C"){
-#     c(0, 1, 0, 0)
-#   } else if (x == "G"){
-#     c(0, 0, 1, 0)
-#   } else if (x == "T"){
-#     c(0, 0, 0, 1)
-#   } else {
-#     c(0, 0, 0, 0)
-#   }
-# }
-# 
-# # one_hot_encode_v <- Vectorize(one_hot_encode)
-# 
-# 
-# encode_one_chunk <- function(str){
-#   v <- base::strsplit(tmp, "")[[1]]
-#   as.matrix(do.call(rbind, lapply(X = v, FUN = one_hot_encode)))
-# }
-# 
-# encode_string <- Vectorize(encode_one_chunk)
-# 
-# 
-# ref.gr %>% 
-#   dplyr::slice(1:100) %>% 
-#   dplyr::group_by(V1, V2) %>% 
-#   dplyr::summarize(ohe = encode_string(V7))
-# 
-# out <- lapply(X=data, FUN=encode_one_chunk)
-# str(out)
-# 
+nrow(merged)
+nrow(ref.dt)
+nrow(snps.dt)

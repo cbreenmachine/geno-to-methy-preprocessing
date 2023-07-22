@@ -33,17 +33,17 @@ rule expand_cpg_windows:
 
 
 
-rule merge_cpg_windows:
-# Merge overlapping CpG bins, this way we don't have to
-# encode so many things, and it should save storage and memory.
-    input:
-        "../data/bed-intervals/cpgs.plus.minus.500.bed"
-    output:
-        "../data/bed-intervals/cpg.intervals.condensed.bed"
-    conda: 
-        "envs/bedtools.yaml"
-    shell:
-        "cat {input} | bedtools merge > {output}"
+# rule merge_cpg_windows:
+# # Merge overlapping CpG bins, this way we don't have to
+# # encode so many things, and it should save storage and memory.
+#     input:
+#         "../data/bed-intervals/cpgs.plus.minus.500.bed"
+#     output:
+#         "../data/bed-intervals/cpg.intervals.condensed.bed"
+#     conda: 
+#         "envs/bedtools.yaml"
+#     shell:
+#         "cat {input} | bedtools merge -d -700 > {output}"
 
 # Write out four files
 # 
@@ -51,14 +51,13 @@ rule merge_cpg_windows:
 rule chunk_genome:
     input:
         "../data/reference/hg38.fna",
-        "../data/bed-intervals/cpg.intervals.condensed.bed"
+        "../data/bed-intervals/cpgs.plus.minus.500.bed"
     output:
         "../data/bed-intervals/reference.chunked.bed"
     conda: 
         "envs/bedtools.yaml"
     shell:
        "bedtools getfasta -fi {input[0]} -bed {input[1]} -bedOut > {output}"
-
 
 encoded_file_outputs = ['A', 'C', 'G', 'T']
 
