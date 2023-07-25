@@ -1,7 +1,11 @@
 # encode_sequence_with_alleles.R
 # Given a bed file with sequence (chrom start end AAAAAAAAACCCCCCTTTTGGGGG...)
-# and a SNP call file (VCF), generate 
-# Outputs four BED files,
+# and a SNP call file (VCF), generates hdf5
+# sample = 253
+#   locus = chr1:100-1100
+#     encoding = [[], [], [], []]
+#     methylated = 10
+#     coverage = 20
 
 library(argparse)
 library(VariantAnnotation)
@@ -10,16 +14,7 @@ library(tidyfast)
 library(GenomicRanges)
 library(data.table)
 library(chunkR)
-
-
-parser <- ArgumentParser()
-
-# by default ArgumentParser will add an help option 
-parser$add_argument("--reference", default = "../../data/bed-intervals/reference.chunked.bed")
-parser$add_argument("--variants", default = "../../data/variant-calls/253.snps.vcf")
-parser$add_argument("--output_prefix", default = "../../data/encoded-data/encoded.sample.")
-
-args <- parser$parse_args()
+library(rhdf5)
 
 
 # Constants ---------------------------------------------------------------
@@ -41,8 +36,8 @@ template <- data.frame(
   dplyr::filter(reference != alternate) # Don't care about homo ref
 
 # Reference / Alt case, code both as 0.5
-case1 <- template %>% 
-  dplyr::mutate(variant.call = "0/1") %>% 
+case1 <- template %>%
+  dplyr::mutate(variant.call = "0/1") %>%
   dplyr::mutate(
     A = ifelse(reference == "A" | alternate == "A", 0.5, 0),
     C = ifelse(reference == "C" | alternate == "C", 0.5, 0),
@@ -51,8 +46,8 @@ case1 <- template %>%
   )
 
 # Alt/Alt case, code alt as 1, everything else as 0
-case2 <- template %>% 
-  dplyr::mutate(variant.call = "1/1") %>% 
+case2 <- template %>%
+  dplyr::mutate(variant.call = "1/1") %>%
   dplyr::mutate(
     A = ifelse(alternate == "A", 1, 0),
     C = ifelse(alternate == "C", 1, 0),
@@ -61,8 +56,8 @@ case2 <- template %>%
   )
 
 # Funky case (code alt as 0.5, other non-ref as 0.25)
-case3 <- template %>% 
-  dplyr::mutate(variant.call = "1/2") %>% 
+case3 <- template %>%
+  dplyr::mutate(variant.call = "1/2") %>%
   dplyr::mutate(
     A = ifelse(alternate == "A", 0.5, ifelse(reference != "A", 0.25, 0)),
     C = ifelse(alternate == "C", 0.5, ifelse(reference != "C", 0.25, 0)),
@@ -71,103 +66,151 @@ case3 <- template %>%
   )
 
 # Join together for merging later
-allele.mapping <- rbind(case1, case2, case3)
+allele_mapping <- rbind(case1, case2, case3)
 
-# Load in SNPs ------------------------------------------------------------
-tmp <- VariantAnnotation::readVcf(args$variants)
+# Load in SNPs function --------------------------------------------------
 
-# Cast to BED standard (0-based, half open)
-snps.dt <- 
-  geno(tmp)$GT %>% 
-  as.data.frame() %>% 
-  rownames_to_column("locus") %>% 
-  rename("variant.call" = 2) %>%
-  separate(col = locus, into = c("chrom", "start", "reference", "alternate")) %>% 
-  dplyr::filter(chrom %in% unique(ref.dt$chrom),
-                reference %in% c("A", "C", "G", "T")) %>% 
-  dplyr::mutate(start = as.numeric(start) - 1,
-                end = start + 1) %>% 
-  left_join(allele.mapping, by = c("reference", "alternate", "variant.call"))
+# SNPs will be used on each iteration of chunkR
+munge_variant_calls <- function(dt) {
+  # Takes VCF (read in thru VariantAnnotation::readVcf)
+  # and renames columns, adds some derived information,
+  # casts to (0, 1] coordinate system
+  as.data.frame(geno(dt)$GT) %>%
+    rownames_to_column("locus") %>%
+    dplyr::rename("variant.call" = 2) %>%
+    dplyr::filter(!str_detect(locus, "chrUn"),
+                  !str_detect(locus, "random")) %>%
+    tidyr::separate(col = locus,
+             into = c("chrom", "pos", "reference", "alternate")) %>%
+    dplyr::filter(reference %in% c("A", "C", "G", "T")) %>%
+    dplyr::mutate(pos = as.numeric(pos)) %>%
+    left_join(allele_mapping, by = c("reference", "alternate", "variant.call"))
+}
 
-gc()
 
 
-# Create function to process reference data (will be read in chunk --------
 
-# Keep everything in BED standard, changes happen to VCF
+munge_reference_data <- function(dt) {
+  # Convert to 1-based coordinate system
+  colnames(dt) <- paste0("V", 1:ncol(dt))
 
-#--> Load data, this is in bed format (coordinate change is corrected implicitly with
-# separate ranging from 0). Keep in BED format (0, 1]
-# chr1:12579:12580, but by the end of plumbing, it is chr1:12579
-ref.raw.dt <- fread(args$reference)
-
-cast_reference_data_to_snp_format <- function(dt){
-  
   # Calculate interval width
   width <- as.numeric(dt[1, "V3"] - dt[1, "V2"])
-  dummy.cols <- paste0("seq", 1:width)
-  
-  dt %>% 
+  dummy_cols <- paste0("seq", 1:width)
+
+  dt %>%
     # Column names
     dplyr::rename(chrom = "V1", start = "V2", end = "V3",
                   strand = "V4", x = "V5", n = "V6") %>% 
     # Keep track of locus, since these will be written out to final BED files
-    dplyr::mutate(locus = paste0(chrom, ":", start, "-", end)) %>% 
+    dplyr::mutate(locus = paste0(chrom, ":", start, "-", end)) %>%
     # Split the string of letters (AACCTTGG) into however many variables we need
-    # It's ok that this produces NAs--there are unevenly sized intervals, which results in 
-    # empty columns
-    dt_separate(col = V7, sep = "", into = dummy.cols) %>% 
-    pivot_longer(cols = all_of(dummy.cols), names_to = "seqix", values_to = "reference") %>% 
-    dplyr::mutate(start = start + as.numeric(str_remove(seqix, "seq")) - 1,
-                  end = start + 1) %>% 
-    left_join(sequence_mapping, by = "reference") %>% 
-    dplyr::select(chrom, start, end, locus, reference, A, C, G, `T`) %>% 
-    drop_na() %>% # empty string returned by separate gives a nonsense row for every chunk
-    dplyr::mutate(alternate = reference, variant.call = "0/0")
+    # It's ok that this produces NAs--there are unevenly sized intervals,
+    #which results in empty columns
+    dt_separate(col = V7, sep = "", into = dummy_cols) %>%
+    tidyr::pivot_longer(cols = tidyr::all_of(dummy_cols),
+                        names_to = "seqix",
+                        values_to = "reference") %>%
+    dplyr::mutate(pos = start +
+                  as.numeric(stringr::str_remove(seqix, "seq")) - 1 + 1) %>%
+    dplyr::left_join(sequence_mapping, by = "reference") %>%
+    dplyr::select(chrom, pos, locus, reference, A, C, G, `T`) %>%
+    # empty string returned by separate gives a nonsense row for every chunk
+    tidyr::drop_na() %>%
+    dplyr::mutate(alternate = NA, variant.call = "0/0")
 }
 
-cast_reference_data_to_snp_format(ref.raw.dt[1:1000, ])
+swap_in_snps <- function(ref_dt, snps_dt) {
 
-# seq.lengths <- unlist(lapply(ref.raw.dt$V7, str_length))
-# summary(seq.lengths)
+  # Because we will do this in chunks, we only want to
+  # perform substitutions
+  ref_dt$is_snp <- FALSE
+  snps_dt$is_snp <- TRUE
 
-# Perform the pipeline to pieces at a time.
-dim(ref.dt)
- 
+  snps_in_range_dt <- semi_join(snps_dt, ref_dt,
+                                by = c("chrom", "pos", "reference"))
 
-# May not be able to do this with data.tables after all. How many swaps do we need to make?
-# Us GRanges list where each list item is a locus and each 
-dim(ref.dt)
-dim(snps.dt)
+  out <- left_join(ref_dt, snps_dt,
+                   by = c("chrom", "pos", "reference")) %>%
+         mutate(is_snp = replace_na(is_snp.y, FALSE),
+         A = NA, C = NA, G = NA, `T` = NA, variant.call = NA,
+         alternate = alternate.y)
 
-locus.dt <- dplyr::select(ref.dt, c(chrom, start, end, locus))
-snps.w.locus.dt <- left_join(snps.dt, locus.dt)
+  # For rows where there is a SNP (called)
+  # we will keep the variant call information. Otherwise,
+  # we will keep the reference information
+  out[out$is_snp, ] %<>% dplyr::mutate(
+                    A = A.y, C = C.y, G = G.y, `T` = `T.y`,
+                    variant.call = variant.call.y
+                  )
 
+    # Non SNPs
+    out[!out$is_snp, ] %<>% dplyr::mutate(
+                    A = A.x, C = C.x, G = G.x, `T` = `T.x`,
+                    variant.call = variant.call.x
+                  )
 
-# Try to correct missing values of ref ----------------------------------------------------
-merged <- anti_join(ref.dt, snps.w.locus.dt, by = c("chrom", "start", "end", "reference")) %>% 
-  bind_rows(snps.w.locus.dt) %>% 
-  dplyr::arrange(chrom, start) %>% 
-  distinct() 
+    swapped <- out %>% 
+      transmute(
+        chrom, pos, locus, reference, alternate, variant.call,
+        A, C, G, `T`)
 
+  return(swapped)
+}
 
-merged <- bind_rows(snps.w.locus.dt, ref.dt) %>% 
-  group_by(chrom, start) %>% 
-  dplyr::filter(n() == 1 | variant.call != "0/0")
+write_data_as_bed <- function(data, ofile) {
+  if (file.exists(ofile)) {
+    fwrite(data, ofile, append = TRUE, sep = "\t")
+  } else {
+    fwrite(data, ofile, append = FALSE, sep = "\t")
+  }
+}
 
-# What happens when a position is in more than one locus? How to impute that?
-head(merged)
+# Run the pipeline (functionalzied) -----------------------
 
-# To check whether this works, we need to look at non homozygous ref
-merged %>% 
-  dplyr::filter(variant.call != "0/0")
+parser <- ArgumentParser()
 
-my.locus <- unique(merged$locus)[2]
-merged %>% 
-  dplyr::filter(locus == my.locus,
-                variant.call != "0/0") %>% 
-  distinct()
+parser$add_argument("--variants", default = "../../data/variant-calls/253.snps.vcf")
+parser$add_argument("--reference", default = "../../data/bed-intervals/reference.chunked.bed")
+parser$add_argument("--ofile", default = "../../data/training/253.chr1.bed")
 
-nrow(merged)
-nrow(ref.dt)
-nrow(snps.dt)
+args <- parser$parse_args()
+
+# Variant data is derived from a VCF file, all of it can be read in
+snps_dt <- munge_variant_calls(VariantAnnotation::readVcf(args$variants))
+# snps_dt <- munge_variant_calls(snps_vcf)
+
+# Chunker obkect allows us to iterate more slowly
+chunker_obj <- chunker(args$reference, sep = "\t",
+                       has_colnames = FALSE,
+                       has_rownames = FALSE,
+                       chunksize = 10000L)
+
+# Initialize the line counter
+lines <- 0
+
+# Important to delete old files
+if (file.exists(args$ofile)) {
+  unlink(args$ofile)
+  cat("Overwriting output file\n")
+}
+
+while (next_chunk(chunker_obj)) {
+  ref_dt <- munge_reference_data(get_table(chunker_obj))
+  swapped_dt <- swap_in_snps(ref_dt, snps_dt)
+    
+  # Make the data frame "wide" so that we can keep using bed tools operations on it
+  swapped_for_bed <- swapped_dt %>%
+    group_by(locus) %>%
+    summarize(A_encoding = paste(A, collapse=","),
+              C_encoding = paste(C, collapse=","),
+              G_encoding = paste(G, collapse=","),
+              T_encoding = paste(`T`, collapse=",")) %>%
+    tidyr::separate(locus, into=c("chrom", "start", "end"))
+
+  write_data_as_bed(swapped_for_bed, args$ofile)
+
+  lines <- lines + nrow(ref_dt)
+  cat("Processed ", lines, "lines\n")
+}
+#END
