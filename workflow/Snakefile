@@ -1,8 +1,18 @@
 from snakemake.remote.FTP import RemoteProvider as FTPRemoteProvider
 FTP = FTPRemoteProvider()
 
+# Placeholder for now
+CHROMS = ['chr17', 'chr18', 'chr19', 'chr20']
+
+# Automatically figure out the sample wildcards
+# SAMPLES = glob_wildcards("../../data/variant-calls/{sample}.snps.vcf") 
+
+SAMPLES = ['253']
+
 rule all:
-    input: "../data/bed-intervals/reference.chunked.bed"
+    input: 
+        expand("../data/training/{sample}.{chrom}.encoded.bed", sample=SAMPLES, chrom=CHROMS)
+    
 
 rule download_reference_genome:
     input:
@@ -12,71 +22,47 @@ rule download_reference_genome:
     shell:
         "gunzip -c {input} > {output}"
 
-rule expand_cpg_windows:
-# Expand around CpG site by () number of nucleotides
-    input:
-        "../data/methylation-counts/253.bed",
-         # https://github.com/igvteam/igv/blob/master/genomes/sizes/hg38.chrom.sizes
+rule split_by_chrom:
+    input: 
+        "../data/methylation-counts/{sample}.bed",
         "../data/reference/hg38.chrom.sizes"
+    output: 
+        "../data/bed-intervals/{sample}.{chrom}.bed"
     params: 
         expand_by=499
-    output:
-        "../data/bed-intervals/cpgs.plus.minus.500.bed"
     conda: 
         "envs/bedtools.yaml"
     shell:
-        "tail -n+2 {input[0]} "
-        "| grep 'chr1\t' "
-        "| bedtools sort "
+        "grep '{wildcards.chrom}' '{input[0]}' "
         "| bedtools slop -b {params.expand_by} -g {input[1]} "
+        "| bedtools sort "       
         "> {output}"
 
 
 
-# rule merge_cpg_windows:
-# # Merge overlapping CpG bins, this way we don't have to
-# # encode so many things, and it should save storage and memory.
-#     input:
-#         "../data/bed-intervals/cpgs.plus.minus.500.bed"
-#     output:
-#         "../data/bed-intervals/cpg.intervals.condensed.bed"
-#     conda: 
-#         "envs/bedtools.yaml"
-#     shell:
-#         "cat {input} | bedtools merge -d -700 > {output}"
 
-# Write out four files
-# 
 
 rule chunk_genome:
     input:
         "../data/reference/hg38.fna",
-        "../data/bed-intervals/cpgs.plus.minus.500.bed"
+        "../data/bed-intervals/{sample}.{chrom}.bed"
     output:
-        "../data/bed-intervals/reference.chunked.bed"
+        "../data/bed-intervals/{sample}.{chrom}.sequence.bed"
     conda: 
         "envs/bedtools.yaml"
     shell:
        "bedtools getfasta -fi {input[0]} -bed {input[1]} -bedOut > {output}"
 
-encoded_file_outputs = ['A', 'C', 'G', 'T']
 
 rule encode_sequence_with_variants:
     input:
-        "../data/bed-intervals/reference.chunked.bed",
-        "../data/variant-calls/253.snps.vcf"
+        "../data/bed-intervals/{sample}.{chrom}.sequence.bed",
+        "../data/variant-calls/{sample}.snps.vcf"
     output:
-        expand("../data/bed-intervals/encoded.253.{x}.bed", x = encoded_file_outputs)
-    params:
-       pfx = "../data/bed-intervals/encoded.253."
+        "../data/training/{sample}.{chrom}.encoded.bed"
     shell:
         r"""
-        ../scripts/encode_sequence_with_alleles.R 
-            --reference () 
-            --variants ()
-            --output_prefix {params.pfx}
+        ./scripts/encode_sequence_with_alleles.R --reference {input[0]} --variants {input[1]} --ofile {output}
         """
         
-
-# bedtools merge later to get 
-# bedtools intersect 
+#END

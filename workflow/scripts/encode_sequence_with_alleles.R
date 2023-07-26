@@ -1,3 +1,5 @@
+#!/usr/bin/env Rscript
+
 # encode_sequence_with_alleles.R
 # Given a bed file with sequence (chrom start end AAAAAAAAACCCCCCTTTTGGGGG...)
 # and a SNP call file (VCF), generates hdf5
@@ -7,14 +9,18 @@
 #     methylated = 10
 #     coverage = 20
 
-library(argparse)
-library(VariantAnnotation)
-library(tidyverse)
-library(tidyfast)
-library(GenomicRanges)
-library(data.table)
-library(chunkR)
-library(rhdf5)
+suppressPackageStartupMessages({
+  library(argparse)
+  library(VariantAnnotation)
+  library(tidyverse)
+  library(tidyfast)
+  library(GenomicRanges)
+  library(data.table)
+  library(chunkR)
+  library(magrittr)
+  library(rhdf5)
+})
+
 
 
 # Constants ---------------------------------------------------------------
@@ -158,29 +164,76 @@ swap_in_snps <- function(ref_dt, snps_dt) {
   return(swapped)
 }
 
-write_data_as_bed <- function(data, ofile) {
-  if (file.exists(ofile)) {
-    fwrite(data, ofile, append = TRUE, sep = "\t")
-  } else {
-    fwrite(data, ofile, append = FALSE, sep = "\t")
+# write_data_as_bed <- function(data, ofile) {
+#   if (file.exists(ofile)) {
+#     fwrite(data, ofile, append = TRUE, sep = "\t", col.names = FALSE)
+#   } else {
+#     fwrite(data, ofile, append = FALSE, sep = "\t", col.names = FALSE)
+#   }
+# }
+
+
+construct_h5 <- function(ofile, s) {
+
+  d <- dirname(ofile)
+
+  if (!dir.exists(d)) {
+    print("Creating directory")
+    dir.create(d)
+  }
+
+  if (!file.exists(ofile)) {
+    print("Constructing file")
+    h5createFile(ofile)
+  }
+
+  existing_groups <- h5ls(ofile)$group
+
+  if (!s %in% existing_groups) {
+    print("Creating sample group")
+    h5createGroup(ofile, sample)
   }
 }
+
+write_one_locus_to_h5 <- function(dt, s, l, ofile) {
+  #  my_locus <- swapped_dt$locus[1]
+
+  # h5createGroup(ofile, s)
+  h5createGroup(ofile, paste0(s, "/", l))
+  
+  embedding <- dt %>%
+    dplyr::filter(locus == l) %>%
+    dplyr::select(c(A, C, G, `T`))
+
+  h5write(embedding, ofile, paste0(s, "/", l, "/embedding"))
+}
+
+
 
 # Run the pipeline (functionalzied) -----------------------
 
 parser <- ArgumentParser()
 
-parser$add_argument("--variants", default = "../../data/variant-calls/253.snps.vcf")
-parser$add_argument("--reference", default = "../../data/bed-intervals/reference.chunked.bed")
-parser$add_argument("--ofile", default = "../../data/training/253.chr1.bed")
+parser$add_argument("--variants", default = "../data/variant-calls/253.snps.vcf")
+parser$add_argument("--reference", default = "../data/bed-intervals/253.chr17.sequence.bed")
+parser$add_argument("--ofile", default = "../data/training/train-test-data-v1.h5")
+parser$add_argument("--overwrite", action = "store_true")
 
 args <- parser$parse_args()
 
+# Derived stuff
+s <- str_extract(args$variants, "[0-9][0-9][0-9]")
+
+# unlink(args$ofile)
+# Prepare h5
+construct_h5(args$ofile, s)
+
 # Variant data is derived from a VCF file, all of it can be read in
 snps_dt <- munge_variant_calls(VariantAnnotation::readVcf(args$variants))
-# snps_dt <- munge_variant_calls(snps_vcf)
 
 # Chunker obkect allows us to iterate more slowly
+# Chr1 has ~2,000,000 CpGs, so up to ~200 output files
+# chromosome
 chunker_obj <- chunker(args$reference, sep = "\t",
                        has_colnames = FALSE,
                        has_rownames = FALSE,
@@ -189,28 +242,23 @@ chunker_obj <- chunker(args$reference, sep = "\t",
 # Initialize the line counter
 lines <- 0
 
-# Important to delete old files
-if (file.exists(args$ofile)) {
-  unlink(args$ofile)
-  cat("Overwriting output file\n")
-}
-
 while (next_chunk(chunker_obj)) {
   ref_dt <- munge_reference_data(get_table(chunker_obj))
   swapped_dt <- swap_in_snps(ref_dt, snps_dt)
-    
-  # Make the data frame "wide" so that we can keep using bed tools operations on it
-  swapped_for_bed <- swapped_dt %>%
-    group_by(locus) %>%
-    summarize(A_encoding = paste(A, collapse=","),
-              C_encoding = paste(C, collapse=","),
-              G_encoding = paste(G, collapse=","),
-              T_encoding = paste(`T`, collapse=",")) %>%
-    tidyr::separate(locus, into=c("chrom", "start", "end"))
 
-  write_data_as_bed(swapped_for_bed, args$ofile)
+  # Get unique loci
+  # ll_range <- unique(swapped_dt$locus)
+
+  # This needs to be defined anew for every new version of `swapped_dt`
+  # write_wrapper <- function(ll) {
+  #   write_one_locus_to_h5(swapped_dt, s, ll, args$ofile)
+  # }
+
+  # lapply(ll_range, write_wrapper)
 
   lines <- lines + nrow(ref_dt)
   cat("Processed ", lines, "lines\n")
 }
+
+h5closeAll()
 #END
