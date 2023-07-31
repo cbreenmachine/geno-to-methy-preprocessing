@@ -11,7 +11,7 @@ SAMPLES = ['253']
 
 rule all:
     input: 
-        expand("../data/training/{sample}.{chrom}.encoded.bed", sample=SAMPLES, chrom=CHROMS)
+        dynamic(expand("../data/encodings/{sample}.{chrom}.{{ix}}.bed", sample=SAMPLES, chrom=CHROMS))
     
 
 rule download_reference_genome:
@@ -40,8 +40,6 @@ rule split_by_chrom:
 
 
 
-
-
 rule chunk_genome:
     input:
         "../data/reference/hg38.fna",
@@ -58,11 +56,13 @@ rule encode_sequence_with_variants:
     input:
         "../data/bed-intervals/{sample}.{chrom}.sequence.bed",
         "../data/variant-calls/{sample}.snps.vcf"
+    params:
+        odir = "../data/encodings/"
     output:
-        "../data/training/{sample}.{chrom}.encoded.bed"
+        dynamic("../data/encodings/{sample}.{chrom}.{ix}.bed")
     shell:
         r"""
-        ./scripts/encode_sequence_with_alleles.R --reference {input[0]} --variants {input[1]} --ofile {output}
+        ./scripts/encode_sequence_with_alleles.R --reference {input[0]} --variants {input[1]} --odir {params.odir}
         """
         
 #END

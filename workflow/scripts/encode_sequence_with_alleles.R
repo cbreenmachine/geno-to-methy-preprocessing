@@ -164,13 +164,18 @@ swap_in_snps <- function(ref_dt, snps_dt) {
   return(swapped)
 }
 
-# write_data_as_bed <- function(data, ofile) {
-#   if (file.exists(ofile)) {
-#     fwrite(data, ofile, append = TRUE, sep = "\t", col.names = FALSE)
-#   } else {
-#     fwrite(data, ofile, append = FALSE, sep = "\t", col.names = FALSE)
-#   }
-# }
+
+write_data_as_tsv <- function(data, ofile) {
+
+  data2 <- data %>%
+    dplyr::transmute(locus, A, C, G, `T`)
+
+  if (file.exists(ofile)) {
+    fwrite(data2, ofile, append = TRUE, sep = "\t", col.names = FALSE)
+  } else {
+    fwrite(data2, ofile, append = FALSE, sep = "\t", col.names = FALSE)
+  }
+}
 
 
 construct_h5 <- function(ofile, s) {
@@ -216,17 +221,23 @@ parser <- ArgumentParser()
 
 parser$add_argument("--variants", default = "../data/variant-calls/253.snps.vcf")
 parser$add_argument("--reference", default = "../data/bed-intervals/253.chr17.sequence.bed")
-parser$add_argument("--ofile", default = "../data/training/train-test-data-v1.h5")
-parser$add_argument("--overwrite", action = "store_true")
+parser$add_argument("--odir", default = "../data/training/")
+# parser$add_argument("--overwrite", action = "store_true")
 
 args <- parser$parse_args()
 
 # Derived stuff
 s <- str_extract(args$variants, "[0-9][0-9][0-9]")
+chr <- str_extract(args$reference, "chr[0-9][0-9]")
 
 # unlink(args$ofile)
 # Prepare h5
-construct_h5(args$ofile, s)
+# construct_h5(args$ofile, s)
+
+
+suffix <- paste0(str_pad(0:500, 3, pad = "0"), ".bed")
+file_names <- file.path(args$odir, paste0(s, ".", chr, ".", suffix))
+
 
 # Variant data is derived from a VCF file, all of it can be read in
 snps_dt <- munge_variant_calls(VariantAnnotation::readVcf(args$variants))
@@ -234,17 +245,27 @@ snps_dt <- munge_variant_calls(VariantAnnotation::readVcf(args$variants))
 # Chunker obkect allows us to iterate more slowly
 # Chr1 has ~2,000,000 CpGs, so up to ~200 output files
 # chromosome
+N_rows <- 10000L
+
 chunker_obj <- chunker(args$reference, sep = "\t",
                        has_colnames = FALSE,
                        has_rownames = FALSE,
-                       chunksize = 10000L)
+                       chunksize = N_rows)
 
 # Initialize the line counter
-lines <- 0
+ix <- 1
 
 while (next_chunk(chunker_obj)) {
   ref_dt <- munge_reference_data(get_table(chunker_obj))
   swapped_dt <- swap_in_snps(ref_dt, snps_dt)
+
+  if (nrow(swapped_dt) == N_rows * 1000) {
+    write_data_as_tsv(swapped_dt, file_names[ix])
+    ix <- ix + 1
+  } else {
+    print(nrow(swapped_dt))
+  }
+ 
 
   # Get unique loci
   # ll_range <- unique(swapped_dt$locus)
@@ -256,9 +277,9 @@ while (next_chunk(chunker_obj)) {
 
   # lapply(ll_range, write_wrapper)
 
-  lines <- lines + nrow(ref_dt)
-  cat("Processed ", lines, "lines\n")
+  # lines <- lines + nrow(ref_dt)
+  # cat("Processed ", lines, "lines\n")
 }
 
-h5closeAll()
+# h5closeAll()
 #END
