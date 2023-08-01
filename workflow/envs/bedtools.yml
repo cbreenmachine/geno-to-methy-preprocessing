@@ -1,8 +1,6 @@
 name: bedtools
 channels:
-  - bioconda
   - defaults
 dependencies:
-  - bedtools=2.26.0=0
-  - zlib=1.2.13=h4dc903c_0
+  - bedtools
 prefix: /Users/ceb/opt/anaconda3/envs/bedtools
