@@ -17,8 +17,9 @@ seq_encoding = pd.DataFrame(
     }
 )
 
+
 # Function to read and preprocess VCF file (variant calls)
-def read_vcf(ifile):
+def read_vcf(ifile, chrom):
     '''
     Reads and extracts relevant information from VCF file
     '''
@@ -30,6 +31,9 @@ def read_vcf(ifile):
                      usecols=[0, 1, 3, 4, 9],
                      names=['chrom', 'pos', 'reference', 'alternate', 'extra_info']
                      )
+    
+    # Filter to shrink the number of comparisons that need to be made
+    df = df.loc[df['chrom'] == chrom]
     
     # Pull out the SNP call
     df['variant_call'] = df['extra_info'].str[:3]
@@ -123,15 +127,16 @@ def read_sequence_bed(ifile, min_reads=5):
     return df
 
 
+seq_df = read_sequence_bed("../../data/bed-intervals/253.chr17.sequence.bed")
 snp_df = read_vcf("../../data/variant-calls/253.snps.vcf")
 
-result = snp_df.apply(encode_snps, axis=1, meta = {0: float, 1:float, 2:float, 3:float}, result_type='expand')
-result.columns = ['A', 'C', 'G', 'T']
+# result = snp_df.apply(encode_snps, axis=1, meta = {0: float, 1:float, 2:float, 3:float}, result_type='expand')
+# result.columns = ['A', 'C', 'G', 'T']
 
-snp_df = snp_df.merge(result, left_index=True, right_index=True)
+# snp_df = snp_df.merge(result, left_index=True, right_index=True)
 
 
-seq_df = read_sequence_bed("../../data/bed-intervals/253.chr17.sequence.bed")
-zz = dd.merge(seq_df, snp_df, on = ['chrom', 'pos'], indicator = True)
 
-write('2023-07-31-data.parq', zz)
+# zz = dd.merge(seq_df, snp_df, on = ['chrom', 'pos'], indicator = True)
+
+# write('2023-07-31-data.parq', zz)
